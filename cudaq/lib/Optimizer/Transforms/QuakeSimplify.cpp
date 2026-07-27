@@ -356,177 +356,49 @@ private:
   double threshold;
 };
 
-// Z = SS = S<adj>S<adj>
-// I = SS<adj> = S<adj>S
-class DoubleSOp : public OpRewritePattern<cudaq::quake::SOp> {
+// Z = SS = S<adj>S<adj>; S = TT; S<adj> = T<adj>T<adj>.
+template <typename SourceOp, typename FoldedOp>
+class DiscretePhaseFold : public OpRewritePattern<SourceOp> {
 public:
-  using OpRewritePattern::OpRewritePattern;
+  DiscretePhaseFold(MLIRContext *context,
+                    cudaq::opt::CommutationAwareRewriteMatcher &matcher)
+      : OpRewritePattern<SourceOp>(context), matcher(matcher) {}
 
-  LogicalResult matchAndRewrite(cudaq::quake::SOp qop,
+  LogicalResult matchAndRewrite(SourceOp anchor,
                                 PatternRewriter &rewriter) const override {
-    if (qop.getNegatedQubitControls())
+    auto match = matcher.findNearest(
+        anchor, cudaq::opt::CommutationSearchDirection::Forward,
+        [&](Operation *candidate) {
+          auto endpoint = dyn_cast<SourceOp>(candidate);
+          return endpoint &&
+                 haveSameControlArityAndPolarity(anchor, endpoint) &&
+                 matcher.haveSameOrderedQuantumOperands(anchor, endpoint);
+        });
+    if (!match)
       return failure();
 
-    auto targets = qop.getTargets();
-    if (targets.size() != 1 ||
-        !cudaq::quake::isQuantumValueType(targets[0].getType())) {
-      LLVM_DEBUG(llvm::dbgs() << "operation must have 1 target\n");
+    auto endpoint = cast<SourceOp>(match->endpoint);
+    // Let AdjointElimination own the nearest opposite-adjoint pair.
+    if (anchor.isAdj() != endpoint.isAdj())
       return failure();
-    }
-    Value trgt = targets[0];
 
-    // Check that these are the same op back-to-back.
-    auto prev = targets[0].template getDefiningOp<cudaq::quake::SOp>();
-    if (!prev) {
-      LLVM_DEBUG(llvm::dbgs() << "previous operation must be the same\n");
-      return failure();
+    UnitAttr foldedAdjoint;
+    if constexpr (std::is_same_v<FoldedOp, cudaq::quake::SOp>)
+      foldedAdjoint = endpoint.getIsAdjAttr();
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(endpoint);
+      rewriter.replaceOpWithNewOp<FoldedOp>(
+          endpoint, endpoint.getResultTypes(), foldedAdjoint, ValueRange{},
+          endpoint.getControls(), endpoint.getTargets(),
+          endpoint.getNegatedQubitControlsAttr());
     }
-    if (prev.getNegatedQubitControls())
-      return failure();
-    if (qop.isAdj() != prev.isAdj()) {
-      LLVM_DEBUG(llvm::dbgs() << "operations have converse adjoint\n");
-      return failure();
-    }
-
-    // Check target is properly threaded.
-    auto prevTrgs = prev.getTargets();
-    if (prevTrgs.size() != 1) {
-      LLVM_DEBUG(llvm::dbgs() << "previous operation must have 1 target\n");
-      return failure();
-    }
-    Value prevTrgt = prevTrgs[0];
-    auto last = prev.getNumResults() - 1;
-    if (!isa<cudaq::quake::WireType>(trgt.getType()) ||
-        !isa<cudaq::quake::WireType>(prevTrgt.getType()) ||
-        trgt != prev.getResult(last)) {
-      LLVM_DEBUG(llvm::dbgs() << "target wire must thread\n");
-      return failure();
-    }
-
-    // Check that the controls (if any) are the same qubits.
-    auto controls = qop.getControls();
-    auto prevCtls = prev.getControls();
-    if (controls.size() != prevCtls.size()) {
-      LLVM_DEBUG(llvm::dbgs() << "must have the same number of controls\n");
-      return failure();
-    }
-    for (auto iter : llvm::enumerate(llvm::zip(controls, prevCtls))) {
-      auto n = iter.index();
-      auto [c, pc] = iter.value();
-      if (!isa<cudaq::quake::WireType>(c.getType()) ||
-          !isa<cudaq::quake::WireType>(pc.getType()) ||
-          c != prev.getResult(n)) {
-        LLVM_DEBUG(llvm::dbgs() << "control wire must be threaded\n");
-        return failure();
-      }
-    }
-
-    if (qop.isAdj() != prev.isAdj()) {
-      // Opposite adjoints cancel. Forward the wires entering the pair to users
-      // of the second operation, then erase the first operation.
-      SmallVector<Value> replacementWires;
-      replacementWires.append(prevCtls.begin(), prevCtls.end());
-      replacementWires.append(prevTrgs.begin(), prevTrgs.end());
-      rewriter.replaceOp(qop, replacementWires);
-      rewriter.eraseOp(prev);
-      return success();
-    }
-
-    // Rewrite the back-to-back S gates.
-    LLVM_DEBUG(llvm::dbgs() << "replaced: " << qop << '\n' << prev << '\n');
-    rewriter.replaceOpWithNewOp<cudaq::quake::ZOp>(
-        qop, qop.getResultTypes(), UnitAttr{}, ValueRange{}, prevCtls, prevTrgs,
-        DenseBoolArrayAttr{});
-    rewriter.eraseOp(prev);
+    rewriter.replaceOp(anchor, getWireOperands(anchor));
     return success();
   }
-};
 
-// S = TT
-// S<adj> = T<adj>T<adj>
-// I = TT<adj> = T<adj>T
-class DoubleTOp : public OpRewritePattern<cudaq::quake::TOp> {
-public:
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(cudaq::quake::TOp qop,
-                                PatternRewriter &rewriter) const override {
-    if (qop.getNegatedQubitControls())
-      return failure();
-
-    auto targets = qop.getTargets();
-    if (targets.size() != 1 ||
-        !cudaq::quake::isQuantumValueType(targets[0].getType())) {
-      LLVM_DEBUG(llvm::dbgs() << "operation must have 1 target\n");
-      return failure();
-    }
-    Value trgt = targets[0];
-
-    // Check that these are the same op back-to-back.
-    auto prev = targets[0].template getDefiningOp<cudaq::quake::TOp>();
-    if (!prev) {
-      LLVM_DEBUG(llvm::dbgs() << "previous operation must be T\n");
-      return failure();
-    }
-    if (prev.getNegatedQubitControls())
-      return failure();
-    if (qop.isAdj() != prev.isAdj()) {
-      LLVM_DEBUG(llvm::dbgs() << "operations have converse adjoint\n");
-      return failure();
-    }
-
-    // Check target is properly threaded.
-    auto prevTrgs = prev.getTargets();
-    if (prevTrgs.size() != 1) {
-      LLVM_DEBUG(llvm::dbgs() << "previous operation must have 1 target\n");
-      return failure();
-    }
-    Value prevTrgt = prevTrgs[0];
-    auto last = prev.getNumResults() - 1;
-    if (!isa<cudaq::quake::WireType>(trgt.getType()) ||
-        !isa<cudaq::quake::WireType>(prevTrgt.getType()) ||
-        trgt != prev.getResult(last)) {
-      LLVM_DEBUG(llvm::dbgs() << "target wire must thread\n");
-      return failure();
-    }
-
-    // Check that the controls (if any) are the same qubits.
-    auto controls = qop.getControls();
-    auto prevCtls = prev.getControls();
-    if (controls.size() != prevCtls.size()) {
-      LLVM_DEBUG(llvm::dbgs() << "must have the same number of controls\n");
-      return failure();
-    }
-    for (auto iter : llvm::enumerate(llvm::zip(controls, prevCtls))) {
-      auto n = iter.index();
-      auto [c, pc] = iter.value();
-      if (!isa<cudaq::quake::WireType>(c.getType()) ||
-          !isa<cudaq::quake::WireType>(pc.getType()) ||
-          c != prev.getResult(n)) {
-        LLVM_DEBUG(llvm::dbgs() << "control wire must be threaded\n");
-        return failure();
-      }
-    }
-
-    if (qop.isAdj() != prev.isAdj()) {
-      // Opposite adjoints cancel. Forward the wires entering the pair to users
-      // of the second operation, then erase the first operation.
-      SmallVector<Value> replacementWires;
-      replacementWires.append(prevCtls.begin(), prevCtls.end());
-      replacementWires.append(prevTrgs.begin(), prevTrgs.end());
-      rewriter.replaceOp(qop, replacementWires);
-      rewriter.eraseOp(prev);
-      return success();
-    }
-
-    // Rewrite the back-to-back S gates.
-    LLVM_DEBUG(llvm::dbgs() << "replaced: " << qop << '\n' << prev << '\n');
-    rewriter.replaceOpWithNewOp<cudaq::quake::SOp>(
-        qop, qop.getResultTypes(), qop.getIsAdjAttr(), ValueRange{}, prevCtls,
-        prevTrgs, DenseBoolArrayAttr{});
-    rewriter.eraseOp(prev);
-    return success();
-  }
+private:
+  cudaq::opt::CommutationAwareRewriteMatcher &matcher;
 };
 
 // S = YSX
@@ -541,6 +413,7 @@ public:
 
     // The uncontrolled rewrite is equal up to global phase. Under control,
     // that phase is relative between control branches and is observable.
+    // TODO: Add explicit phase compensation when Quake models global phase.
     if (!qop.getControls().empty())
       return failure();
 
@@ -685,14 +558,16 @@ public:
     auto *op = getOperation();
     cudaq::opt::CommutationAwareRewriteDriver driver(*ctx);
     auto &patterns = driver.getPatterns();
-    patterns.add<DoubleSOp, DoubleTOp, EraseDoubleReset, EraseResetSink,
-                 ReduceYSX, RotationCombine<cudaq::quake::R1Op>,
+    patterns.add<EraseDoubleReset, EraseResetSink, ReduceYSX,
+                 RotationCombine<cudaq::quake::R1Op>,
                  RotationCombine<cudaq::quake::RxOp>,
                  RotationCombine<cudaq::quake::RyOp>,
                  RotationCombine<cudaq::quake::RzOp>,
                  RotationCombine<cudaq::quake::PhasedRxOp>>(ctx, threshold);
     auto &matcher = driver.getMatcher();
-    patterns.add<HermitianElimination<cudaq::quake::HOp>,
+    patterns.add<DiscretePhaseFold<cudaq::quake::SOp, cudaq::quake::ZOp>,
+                 DiscretePhaseFold<cudaq::quake::TOp, cudaq::quake::SOp>,
+                 HermitianElimination<cudaq::quake::HOp>,
                  HermitianElimination<cudaq::quake::SwapOp>,
                  HermitianElimination<cudaq::quake::XOp>,
                  HermitianElimination<cudaq::quake::YOp>,
