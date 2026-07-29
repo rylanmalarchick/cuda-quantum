@@ -144,6 +144,14 @@ void cudaq::opt::addDecomposition(OpPassManager &pm,
   pm.addPass(cudaq::opt::createDecomposition(opts));
 }
 
+void cudaq::opt::addPhaseLifecycle(OpPassManager &pm) {
+  pm.addNestedPass<func::FuncOp>(cudaq::opt::createExpandControlVeqs());
+  pm.addNestedPass<func::FuncOp>(mlir::createCSEPass());
+  pm.addNestedPass<func::FuncOp>(cudaq::opt::createNormalizePhasePlacement());
+  pm.addNestedPass<func::FuncOp>(cudaq::opt::createLowerPhase());
+  pm.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
+}
+
 static void
 createTargetDeployPipeline(OpPassManager &pm,
                            const TargetDeployPipelineOptions &options) {

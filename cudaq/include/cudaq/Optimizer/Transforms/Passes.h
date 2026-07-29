@@ -54,6 +54,10 @@ void addDecomposition(mlir::OpPassManager &pm,
                       mlir::ArrayRef<std::string> enabledPats,
                       mlir::ArrayRef<std::string> disabledPats = {});
 
+/// Append the common pipeline that expands, normalizes, and lowers
+/// `quake.phase` operations before final code generation.
+void addPhaseLifecycle(mlir::OpPassManager &pm);
+
 void registerAOTPipelines();
 void registerJITPipelines();
 

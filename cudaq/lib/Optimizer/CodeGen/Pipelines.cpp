@@ -109,6 +109,9 @@ void createTargetCodegenPipeline(PassManager &pm,
     pm.addNestedPass<func::FuncOp>(cudaq::opt::createQuakeSimplify());
     pm.addNestedPass<func::FuncOp>(cudaq::opt::createDeadQuantumElimination());
   }
+
+  cudaq::opt::addPhaseLifecycle(pm);
+
   ::addQIRConversionPipeline(pm, options.target);
   // QIR conversion may introduce cc.loop, lower to cf.
   cudaq::opt::addLowerToCFG(pm);
