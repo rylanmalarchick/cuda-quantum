@@ -1,0 +1,190 @@
+# ============================================================================ #
+# Copyright (c) 2026 NVIDIA Corporation & Affiliates.                          #
+# All rights reserved.                                                         #
+#                                                                              #
+# This source code and the accompanying materials are made available under     #
+# the terms of the Apache License 2.0 which accompanies this distribution.     #
+# ============================================================================ #
+
+# Tests for defining a CUDA-Q runtime endpoint in Python.
+#
+# An endpoint is a plain object implementing one or more of the protocols in
+# `cudaq._experimental`. Registering it with `set_runtime_endpoint` redirects
+# the *launch* step of `cudaq.sample` / `observe` / `run` into that object,
+# while compilation stays with the active target.
+
+import cudaq
+import cudaq.mlir.ir as mlir
+import pytest
+
+from cudaq._experimental import (
+    SupportsObserve,
+    SupportsRun,
+    SupportsSample,
+    set_runtime_endpoint,
+)
+
+
+@pytest.fixture(scope="function", autouse=True)
+def reset():
+    cudaq.reset_target()
+    yield
+    cudaq.reset_target()
+
+
+@cudaq.kernel
+def kernel(n_qubits: int, array: list[int]):
+    qbs = cudaq.qvector(n_qubits)
+    h(qbs[0])
+
+
+@cudaq.kernel
+def returning_kernel() -> int:
+    q = cudaq.qubit()
+    return 1
+
+
+class DemoEndpoint:
+    """Records every launch and returns a canned result."""
+
+    def __init__(self):
+        self.calls = []
+        self.mlir_module = None
+
+    def sample(self, module, args, **kwargs):
+        self.calls.append(("sample", repr(args), kwargs))
+        self.mlir_module = module.mlir_module
+        return cudaq.SampleResult({"00": kwargs["shots_count"]})
+
+    def observe(self, module, args, **kwargs):
+        self.calls.append(("observe", repr(args), kwargs))
+        self.mlir_module = module.mlir_module
+        return cudaq.ObserveResult(0.25, kwargs["spin_operator"],
+                                   cudaq.SampleResult())
+
+    def run(self, module, args, **kwargs):
+        self.calls.append(("run", repr(args), kwargs))
+        self.mlir_module = module.mlir_module
+        return ""
+
+
+def test_protocol_conformance():
+    endpoint = DemoEndpoint()
+    assert isinstance(endpoint, SupportsSample)
+    assert isinstance(endpoint, SupportsObserve)
+    assert isinstance(endpoint, SupportsRun)
+
+
+def test_rejects_non_endpoint():
+
+    class NotAnEndpoint:
+        pass
+
+    with pytest.raises(TypeError, match="not a runtime endpoint"):
+        set_runtime_endpoint(NotAnEndpoint())
+
+
+def test_sample_launch():
+    endpoint = DemoEndpoint()
+    set_runtime_endpoint(endpoint)
+
+    assert endpoint.calls == []
+    result = cudaq.sample(kernel, 1, [1, 2, 3], shots_count=137)
+
+    assert len(endpoint.calls) == 1
+    name, args, kwargs = endpoint.calls[0]
+    assert name == "sample"
+    # The first argument is a scalar and decodes; the vector does not.
+    assert args == "KernelArgs([1, <instance of !cc.stdvec<i64>>])"
+    assert kwargs["shots_count"] == 137
+    assert kwargs["explicit_measurements"] is False
+
+    # The counts produced by the endpoint reach the caller.
+    assert result["00"] == 137
+    assert isinstance(endpoint.mlir_module, mlir.Module)
+
+
+def test_observe_launch():
+    endpoint = DemoEndpoint()
+    set_runtime_endpoint(endpoint)
+
+    result = cudaq.observe(kernel, cudaq.spin.x(0), 2, [])
+
+    assert len(endpoint.calls) == 1
+    name, args, kwargs = endpoint.calls[0]
+    assert name == "observe"
+    assert args == "KernelArgs([2, <instance of !cc.stdvec<i64>>])"
+    assert str(kwargs["spin_operator"]) == str(cudaq.spin.x(0))
+
+    assert result.expectation() == pytest.approx(0.25)
+    assert isinstance(endpoint.mlir_module, mlir.Module)
+
+
+def test_run_launch():
+    endpoint = DemoEndpoint()
+    set_runtime_endpoint(endpoint)
+
+    # A local endpoint is launched once per shot.
+    cudaq.run(returning_kernel, shots_count=3)
+
+    assert [name for name, _, _ in endpoint.calls] == ["run"] * 3
+    assert isinstance(endpoint.mlir_module, mlir.Module)
+
+
+def test_sample_twice_reuses_the_endpoint():
+    endpoint = DemoEndpoint()
+    set_runtime_endpoint(endpoint)
+
+    cudaq.sample(kernel, 1, [1, 2, 3], shots_count=10)
+    cudaq.sample(kernel, 2, [1, 2, 3], shots_count=10)
+
+    assert [args for _, args, _ in endpoint.calls] == [
+        "KernelArgs([1, <instance of !cc.stdvec<i64>>])",
+        "KernelArgs([2, <instance of !cc.stdvec<i64>>])",
+    ]
+
+
+def test_unimplemented_policy_raises():
+
+    class SampleOnly:
+
+        def sample(self, module, args, **kwargs):
+            return cudaq.SampleResult()
+
+    set_runtime_endpoint(SampleOnly())
+    with pytest.raises(RuntimeError,
+                       match="does not implement 'observe'.*'observe' policy"):
+        cudaq.observe(kernel, cudaq.spin.x(0), 2, [])
+
+
+def test_endpoint_errors_propagate():
+
+    class Failing:
+
+        def sample(self, module, args, **kwargs):
+            raise ValueError("backend is down")
+
+    set_runtime_endpoint(Failing())
+    # The kernel invocation crosses several language boundaries on its way back
+    # out, so only the message is guaranteed to survive verbatim.
+    with pytest.raises((ValueError, RuntimeError), match="backend is down"):
+        cudaq.sample(kernel, 1, [1, 2, 3])
+
+
+def test_reset_target_restores_the_simulator():
+    endpoint = DemoEndpoint()
+    set_runtime_endpoint(endpoint)
+    cudaq.sample(kernel, 1, [1, 2, 3], shots_count=10)
+    assert len(endpoint.calls) == 1
+
+    cudaq.reset_target()
+
+    # Back on the simulator: real counts, and the endpoint is not consulted.
+    result = cudaq.sample(kernel, 1, [1, 2, 3], shots_count=100)
+    assert result.get_total_shots() == 100
+    assert len(endpoint.calls) == 1
+
+
+if __name__ == "__main__":
+    import sys
+    pytest.main([__file__, "-v"] + sys.argv[1:])

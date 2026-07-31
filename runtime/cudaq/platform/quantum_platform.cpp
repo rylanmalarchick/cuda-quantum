@@ -358,6 +358,10 @@ void quantum_platform::ensureRuntimeEndpointExists(std::size_t qpuId,
 void quantum_platform::resetRuntimeEndpoints() {
   std::scoped_lock lock(runtimeEndpointsMutex);
   runtimeEndpoints.clear();
+  // `setRuntimeEndpoint` installs a default compile target when the endpoint
+  // discards the backing QPU. The QPUs are being replaced, so drop the
+  // override and let the new QPUs supply their own compile target again.
+  compileTarget.reset();
 }
 
 QPU &quantum_platform::addQPU(std::unique_ptr<QPU> qpu) {
