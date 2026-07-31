@@ -145,7 +145,6 @@ void cudaq::opt::addDecomposition(OpPassManager &pm,
 }
 
 void cudaq::opt::addPhaseLifecycle(OpPassManager &pm) {
-  pm.addNestedPass<func::FuncOp>(cudaq::opt::createExpandControlVeqs());
   pm.addNestedPass<func::FuncOp>(mlir::createCSEPass());
   pm.addNestedPass<func::FuncOp>(cudaq::opt::createNormalizePhasePlacement());
   pm.addNestedPass<func::FuncOp>(cudaq::opt::createLowerPhase());
